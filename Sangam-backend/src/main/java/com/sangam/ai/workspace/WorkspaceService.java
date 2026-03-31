@@ -2,17 +2,22 @@ package com.sangam.ai.workspace;
 
 import com.sangam.ai.ai.AiMessage;
 import com.sangam.ai.ai.AiProvider;
+import com.sangam.ai.ai.PromptPolicyService;
+import com.sangam.ai.realtime.CentrifugoService;
 import com.sangam.ai.user.User;
 import com.sangam.ai.workspace.dto.*;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class WorkspaceService {
@@ -21,6 +26,9 @@ public class WorkspaceService {
     private final SoloChatRepository soloChatRepository;
     private final SoloChatMessageRepository soloChatMessageRepository;
     private final AiProvider aiProvider;
+    private final PromptPolicyService promptPolicyService;
+    private final CentrifugoService centrifugoService;
+    private final TransactionTemplate transactionTemplate;
 
     public List<ProjectResponse> listProjects(User user) {
         return projectRepository.findByOwnerOrderByUpdatedAtDesc(user)
@@ -124,28 +132,74 @@ public class WorkspaceService {
             chat.setTitle(deriveChatTitle(content));
         }
 
-        String assistantReply = generateAssistantReply(chat, content);
-
         SoloChatMessage assistantMessage = SoloChatMessage.builder()
                 .chat(chat)
                 .role(SoloChatMessage.Role.ASSISTANT)
-                .status(SoloChatMessage.Status.COMPLETE)
-                .content(assistantReply)
+                .status(SoloChatMessage.Status.STREAMING)
+                .content("")
                 .build();
         soloChatMessageRepository.save(assistantMessage);
 
         chat.setUpdatedAt(Instant.now());
         soloChatRepository.save(chat);
 
+        List<AiMessage> messages = buildAiMessages(chat, content);
+        streamAssistantReply(chat.getId(), assistantMessage.getId(), messages);
+
         return toDetail(chat);
     }
 
-    private String generateAssistantReply(SoloChat chat, String latestUserMessage) {
+    private void streamAssistantReply(UUID chatId, UUID messageId, List<AiMessage> messages) {
+        StringBuilder fullReply = new StringBuilder();
+
+        aiProvider.streamResponse(messages)
+                .doOnNext(chunk -> {
+                    fullReply.append(chunk);
+                    updateStreamingMessageContent(messageId, fullReply.toString());
+                    centrifugoService.publishSoloChatChunk(chatId, messageId, chunk);
+                })
+                .doOnError(error -> {
+                    log.error("Streaming failed for solo chat {}", chatId, error);
+                    finalizeMessage(messageId, fullReply.toString(), SoloChatMessage.Status.COMPLETE);
+                    centrifugoService.publishSoloChatComplete(chatId, messageId);
+                })
+                .doOnComplete(() -> {
+                    finalizeMessage(messageId, fullReply.toString(), SoloChatMessage.Status.COMPLETE);
+                    centrifugoService.publishSoloChatComplete(chatId, messageId);
+                })
+                .subscribe();
+    }
+
+    private void updateStreamingMessageContent(UUID messageId, String content) {
+        transactionTemplate.executeWithoutResult(s -> {
+            soloChatMessageRepository.findById(messageId).ifPresent(message -> {
+                message.setContent(content);
+                message.setStatus(SoloChatMessage.Status.STREAMING);
+                soloChatMessageRepository.save(message);
+            });
+        });
+    }
+
+    private void finalizeMessage(UUID messageId, String content, SoloChatMessage.Status status) {
+        transactionTemplate.executeWithoutResult(s -> {
+            soloChatMessageRepository.findById(messageId).ifPresent(message -> {
+                message.setContent(content);
+                message.setStatus(status);
+                soloChatMessageRepository.save(message);
+            });
+        });
+    }
+
+    private List<AiMessage> buildAiMessages(SoloChat chat, String latestUserMessage) {
         List<AiMessage> messages = new ArrayList<>();
-        messages.add(AiMessage.system(buildSystemPrompt(chat.getProject())));
+        messages.add(AiMessage.system(
+                promptPolicyService.buildPersonalSystemPrompt(chat.getProject(), latestUserMessage)
+        ));
 
         List<SoloChatMessage> history = soloChatMessageRepository.findByChatIdOrderByCreatedAtAsc(chat.getId());
         for (SoloChatMessage message : history) {
+            if (message.getStatus() == SoloChatMessage.Status.STREAMING) continue;
+            
             if (message.getRole() == SoloChatMessage.Role.USER) {
                 messages.add(AiMessage.user(message.getContent()));
             } else if (message.getRole() == SoloChatMessage.Role.ASSISTANT) {
@@ -159,38 +213,7 @@ public class WorkspaceService {
             messages.add(AiMessage.user(latestUserMessage));
         }
 
-        return aiProvider.streamResponse(messages)
-                .collectList()
-                .map(chunks -> String.join("", chunks))
-                .blockOptional()
-                .filter(reply -> !reply.isBlank())
-                .orElseThrow(() -> new IllegalStateException("AI returned an empty response"));
-    }
-
-    private String buildSystemPrompt(Project project) {
-        StringBuilder prompt = new StringBuilder("""
-                You are SangamAI, a personal AI assistant.
-                Write clear, well-structured markdown.
-                Use fenced code blocks for code.
-                Be concise when the user asks for concise output, otherwise be thorough and practical.
-                """);
-
-        if (project != null) {
-            prompt.append("\n\nThis chat belongs to a persistent project workspace.");
-            prompt.append("\nProject name: ").append(project.getName());
-
-            if (project.getDescription() != null && !project.getDescription().isBlank()) {
-                prompt.append("\nProject description:\n").append(project.getDescription().trim());
-            }
-            if (project.getSystemInstructions() != null && !project.getSystemInstructions().isBlank()) {
-                prompt.append("\nProject instructions:\n").append(project.getSystemInstructions().trim());
-            }
-            if (project.getKnowledgeContext() != null && !project.getKnowledgeContext().isBlank()) {
-                prompt.append("\nProject knowledge:\n").append(project.getKnowledgeContext().trim());
-            }
-        }
-
-        return prompt.toString();
+        return messages;
     }
 
     private SoloChatSummaryResponse toSummary(SoloChat chat) {

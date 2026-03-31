@@ -72,4 +72,19 @@ public class CentrifugoService {
     public void publishEnvironmentEvent(UUID environmentId, Object eventData) {
         publish("env:" + environmentId, eventData);
     }
+
+    public void publishSoloChatChunk(UUID chatId, UUID messageId, String chunk) {
+        publish("chat:" + chatId + ":stream", Map.of(
+                "type", "chunk",
+                "messageId", messageId.toString(),
+                "content", chunk
+        ));
+    }
+
+    public void publishSoloChatComplete(UUID chatId, UUID messageId) {
+        publish("chat:" + chatId + ":stream", Map.of(
+                "type", "done",
+                "messageId", messageId.toString()
+        ));
+    }
 }

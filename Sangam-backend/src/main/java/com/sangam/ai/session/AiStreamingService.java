@@ -2,6 +2,7 @@ package com.sangam.ai.session;
 
 import com.sangam.ai.ai.AiMessage;
 import com.sangam.ai.ai.AiProvider;
+import com.sangam.ai.ai.PromptPolicyService;
 import com.sangam.ai.realtime.CentrifugoService;
 import com.sangam.ai.user.UserRepository;
 import lombok.RequiredArgsConstructor;
@@ -22,6 +23,7 @@ public class AiStreamingService {
     private final SessionRepository sessionRepository;
     private final UserRepository userRepository;
     private final AiProvider aiProvider;
+    private final PromptPolicyService promptPolicyService;
     private final CentrifugoService centrifugoService;
     private final SnapshotCacheService snapshotCacheService;
 
@@ -71,19 +73,9 @@ public class AiStreamingService {
 
     private List<AiMessage> buildRootContext(Session session, String question) {
         List<AiMessage> messages = new ArrayList<>();
-
-        messages.add(AiMessage.system("""
-                You are a collaborative AI assistant in SangamAI, a platform
-                where teams have shared AI conversations together in real time.
-
-                Write clean, well-structured markdown.
-                Group related explanation into meaningful paragraphs instead of
-                one-sentence fragments.
-                If you include code, always wrap it in fenced code blocks using
-                triple backticks. Keep each code example in a single fenced block.
-                Do not split one code example across multiple blocks.
-                Use headings or bullet points only when they improve clarity.
-                """));
+        messages.add(AiMessage.system(
+                promptPolicyService.buildCollaborativeRootPrompt(question)
+        ));
 
         List<ConversationNode> history = nodeRepository
                 .findBySessionIdOrderByCreatedAtAsc(session.getId())
@@ -113,30 +105,13 @@ public class AiStreamingService {
             String question) {
 
         List<AiMessage> messages = new ArrayList<>();
-
-        messages.add(AiMessage.system(String.format("""
-                You are a collaborative AI assistant in SangamAI.
-
-                Here is the full AI response given in this session:
-                --- BEGIN SESSION CONTEXT ---
-                %s
-                --- END SESSION CONTEXT ---
-
-                The user is asking about this specific paragraph:
-                --- BEGIN PARAGRAPH ---
-                %s
-                --- END PARAGRAPH ---
-
-                Answer focused on that paragraph.
-                Write clean, well-structured markdown.
-                Group related explanation into meaningful paragraphs instead of
-                one-sentence fragments.
-                If you include code, always wrap it in a single fenced code block
-                using triple backticks and do not split that code across blocks.
-                """,
-                parentNode.getFullContent(),
-                targetParagraph.getContent()
-        )));
+        messages.add(AiMessage.system(
+                promptPolicyService.buildCollaborativeParagraphPrompt(
+                        parentNode.getFullContent(),
+                        targetParagraph.getContent(),
+                        question
+                )
+        ));
 
         int start = Math.max(0, threadHistory.size() - 10);
         for (ConversationNode past : threadHistory.subList(start, threadHistory.size())) {

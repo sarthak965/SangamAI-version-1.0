@@ -18,6 +18,7 @@ import "prismjs/components/prism-sql";
 import "prismjs/components/prism-json";
 import "prismjs/components/prism-bash";
 import { api } from "../lib/api";
+import { realtimeManager } from "../lib/realtime";
 import type { SoloChatDetailResponse, SoloChatMessageResponse } from "../types";
 
 export default function WorkspaceChatPage({
@@ -46,6 +47,70 @@ export default function WorkspaceChatPage({
   }, [chatId, token]);
 
   useEffect(() => {
+    if (!chatId || !token) return;
+
+    let unsubscribe: (() => void) | null = null;
+
+    const connectToStream = async () => {
+      try {
+        unsubscribe = await realtimeManager.subscribe<{
+          type: "chunk" | "done";
+          messageId: string;
+          content?: string;
+        }>(token, `chat:${chatId}:stream`, (data) => {
+          setChat((prevChat) => applyStreamEvent(prevChat, data));
+        });
+      } catch (err) {
+        console.error("Failed to subscribe to chat stream", err);
+      }
+    };
+
+    void connectToStream();
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [chatId, token]);
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const isStreaming = chat?.messages.some((m) => m.status === "STREAMING");
+    if (isStreaming) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [chat?.messages]);
+
+  useEffect(() => {
+    if (!chatId || !chat?.messages.some((message) => message.status === "STREAMING")) {
+      return;
+    }
+
+    let active = true;
+
+    const refreshChat = async () => {
+      try {
+        const latest = await api.getSoloChat(token, chatId);
+        if (!active) return;
+        setChat((prevChat) => mergeChatDetail(prevChat, latest));
+      } catch {
+        // Keep the current UI state if a polling attempt fails.
+      }
+    };
+
+    const interval = window.setInterval(() => {
+      void refreshChat();
+    }, 1000);
+
+    void refreshChat();
+
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [chatId, chat?.messages, token]);
+
+  useEffect(() => {
     autoSizeTextarea(textareaRef.current, 48, 120);
   }, [draft]);
 
@@ -55,7 +120,7 @@ export default function WorkspaceChatPage({
     setError(null);
     try {
       const updated = await api.sendSoloMessage(token, chatId, draft.trim());
-      setChat(updated);
+      setChat((prevChat) => mergeChatDetail(prevChat, updated));
       setDraft("");
       await onWorkspaceChanged();
     } catch (err) {
@@ -98,6 +163,7 @@ export default function WorkspaceChatPage({
             <WorkspaceMessage key={message.id} message={message} />
           ))
         )}
+        <div ref={messagesEndRef} />
       </div>
 
       <div className="chat-composer">
@@ -133,6 +199,7 @@ export default function WorkspaceChatPage({
 
 function WorkspaceMessage({ message }: { message: SoloChatMessageResponse }) {
   const isAssistant = message.role === "ASSISTANT";
+  const isStreaming = message.status === "STREAMING";
 
   return (
     <div className={`chat-message ${isAssistant ? "assistant-turn" : "user-turn"}`}>
@@ -144,13 +211,103 @@ function WorkspaceMessage({ message }: { message: SoloChatMessageResponse }) {
       </div>
       {isAssistant ? (
         <div className="ai-response">
-          <MarkdownBlock content={message.content} />
+          {message.content === "" && isStreaming ? (
+            <div className="streaming-indicator">
+              <span className="dot" />
+              <span className="dot" />
+              <span className="dot" />
+            </div>
+          ) : (
+            <MarkdownBlock content={message.content} />
+          )}
         </div>
       ) : (
         <div className="workspace-user-bubble">{message.content}</div>
       )}
     </div>
   );
+}
+
+function applyStreamEvent(
+  prevChat: SoloChatDetailResponse | null,
+  data: { type: "chunk" | "done"; messageId: string; content?: string },
+): SoloChatDetailResponse | null {
+  if (!prevChat) return prevChat;
+
+  const messageIndex = prevChat.messages.findIndex((msg) => msg.id === data.messageId);
+
+  if (messageIndex === -1) {
+    const streamedMessage: SoloChatMessageResponse = {
+      id: data.messageId,
+      role: "ASSISTANT",
+      status: data.type === "done" ? "COMPLETE" : "STREAMING",
+      content: data.type === "chunk" ? (data.content ?? "") : "",
+      createdAt: new Date().toISOString(),
+    };
+
+    return {
+      ...prevChat,
+      messages: [...prevChat.messages, streamedMessage],
+    };
+  }
+
+  const messages = [...prevChat.messages];
+  const existing = messages[messageIndex];
+  messages[messageIndex] =
+    data.type === "chunk"
+      ? { ...existing, status: "STREAMING", content: existing.content + (data.content ?? "") }
+      : { ...existing, status: "COMPLETE" };
+
+  return {
+    ...prevChat,
+    messages,
+  };
+}
+
+function mergeChatDetail(
+  prevChat: SoloChatDetailResponse | null,
+  incoming: SoloChatDetailResponse,
+): SoloChatDetailResponse {
+  if (!prevChat || prevChat.id !== incoming.id) {
+    return incoming;
+  }
+
+  const previousMessagesById = new Map(prevChat.messages.map((message) => [message.id, message]));
+  const mergedMessages = incoming.messages.map((message) => {
+    const previous = previousMessagesById.get(message.id);
+    if (!previous) return message;
+
+    const mergedContent =
+      previous.content.length > message.content.length ? previous.content : message.content;
+    const mergedStatus: SoloChatMessageResponse["status"] =
+      previous.status === "COMPLETE" || message.status === "COMPLETE"
+        ? "COMPLETE"
+        : "STREAMING";
+
+    return {
+      ...message,
+      content: mergedContent,
+      status: mergedStatus,
+    };
+  });
+
+  for (const previous of prevChat.messages) {
+    if (!mergedMessages.some((message) => message.id === previous.id)) {
+      mergedMessages.push(previous);
+    }
+  }
+
+  mergedMessages.sort((a, b) => {
+    const timeDiff =
+      new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+    if (timeDiff !== 0) return timeDiff;
+    return a.id.localeCompare(b.id);
+  });
+
+  return {
+    ...incoming,
+    messages: mergedMessages,
+  };
 }
 
 function MarkdownBlock({ content }: { content: string }) {
