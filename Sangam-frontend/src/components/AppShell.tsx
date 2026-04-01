@@ -1,7 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import type { CurrentUser, ProjectResponse, SoloChatSummaryResponse } from "../types";
-import { useTheme } from "../lib/theme";
 import { api } from "../lib/api";
 import ChatOverflowMenu from "./ChatOverflowMenu";
 
@@ -22,7 +21,6 @@ export default function AppShell({
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
-  const { theme, toggle: toggleTheme } = useTheme();
   const location = useLocation();
   const navigate = useNavigate();
   const isMobile = typeof window !== "undefined" && window.innerWidth <= 1024;
@@ -139,10 +137,10 @@ export default function AppShell({
                       type="button"
                       onClick={() => navigate(`/app/chats/${chat.id}`)}
                     >
-                      <strong>
+                      <span className="workspace-recent-title">
                         {chat.pinned && <span className="workspace-recent-pin">📌</span>}
                         {chat.title}
-                      </strong>
+                      </span>
                     </button>
                     <ChatOverflowMenu
                       token={token}
@@ -163,12 +161,6 @@ export default function AppShell({
         </div>
 
         <div className="workspace-sidebar-foot">
-          <button className="theme-toggle workspace-theme-toggle" onClick={toggleTheme} type="button">
-            <span className="link-icon">{theme === "dark" ? "◐" : "◑"}</span>
-            {theme === "dark" ? "Dark mode" : "Light mode"}
-            <div className={`toggle-track ${theme === "dark" ? "active" : ""}`} />
-          </button>
-
           <NavLink
             to="/app/profile"
             className={({ isActive }) => `workspace-profile-chip ${isActive ? "active" : ""}`}
@@ -196,7 +188,11 @@ export default function AppShell({
       </aside>
 
       <main className={`workspace-main ${showSidebar ? "" : "expanded"}`}>
-        <div className="app-content">{children}</div>
+        <div className="app-content">
+          <div key={location.pathname} className="route-transition">
+            {children}
+          </div>
+        </div>
       </main>
     </div>
   );

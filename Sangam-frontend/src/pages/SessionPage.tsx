@@ -38,7 +38,7 @@ const MAX_THREAD_DEPTH = 3;
 
 type ViewState =
   | { type: "root"; title: string }
-  | { type: "paragraph"; nodeId: string; paragraphId: string }
+  | { type: "paragraph"; nodeId: string; blockIndex: number }
   | { type: "node"; nodeId: string; question: string };
 
 type RenderableBlock =
@@ -68,10 +68,12 @@ export default function SessionPage({
   const sessionUnsub = useRef<(() => void) | null>(null);
   const envUnsub = useRef<(() => void) | null>(null);
   const nodeUnsubs = useRef<Record<string, () => void>>({});
+  const chatContainerRef = useRef<HTMLDivElement>(null);
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const hasScrolledToBottom = useRef(false);
   const refreshInFlight = useRef(false);
   const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const viewScrollPositions = useRef<Record<string, number>>({ root: 0 });
 
   const selectedSession = useMemo(
     () => sessions.find((session) => session.sessionId === sessionId) ?? null,
@@ -115,7 +117,7 @@ export default function SessionPage({
 
     setStreamingNodes((current) => ({
       ...current,
-      [nodeId]: current[nodeId] ?? { nodeId, content: "", paragraphs: [], done: false, ...meta },
+      [nodeId]: current[nodeId] ?? { nodeId, content: "", done: false, ...meta },
     }));
 
     const unsub = await realtimeManager.subscribe<NodeStreamEvent>(
@@ -126,7 +128,6 @@ export default function SessionPage({
           const active = current[nodeId] ?? {
             nodeId,
             content: "",
-            paragraphs: [],
             done: false,
             ...meta,
           };
@@ -134,29 +135,6 @@ export default function SessionPage({
           if (data.type === "chunk") {
             setSnapshot((prev) => (prev ? appendNodeContent(prev, nodeId, data.content) : prev));
             return { ...current, [nodeId]: { ...active, content: active.content + data.content } };
-          }
-
-          if (data.type === "paragraph_ready") {
-            setSnapshot((prev) =>
-              prev
-                ? upsertParagraph(prev, nodeId, {
-                    id: data.paragraphId,
-                    index: data.index,
-                    content: data.content,
-                    childNodeCount: getParagraphChildCount(prev, nodeId, data.paragraphId),
-                  })
-                : prev,
-            );
-            return {
-              ...current,
-              [nodeId]: {
-                ...active,
-                paragraphs: [
-                  ...active.paragraphs.filter((paragraph) => paragraph.id !== data.paragraphId),
-                  { id: data.paragraphId, index: data.index, content: data.content },
-                ].sort((a, b) => a.index - b.index),
-              },
-            };
           }
 
           if (data.type === "done") {
@@ -189,6 +167,7 @@ export default function SessionPage({
           question: node.question ?? undefined,
           parentNodeId: node.parentId ?? undefined,
           paragraphId: node.paragraphId ?? undefined,
+          blockIndex: undefined,
         }),
       ),
     ).catch((e: Error) => setError(e.message));
@@ -242,6 +221,7 @@ export default function SessionPage({
             question: data.question,
             parentNodeId: data.type === "child_node_created" ? data.parentNodeId : undefined,
             paragraphId: data.type === "child_node_created" ? data.paragraphId : undefined,
+            blockIndex: data.type === "child_node_created" ? data.blockIndex : undefined,
           });
           setSnapshot((prev) => {
             if (!prev) return prev;
@@ -251,6 +231,7 @@ export default function SessionPage({
             return insertChildNode(
               prev,
               data.parentNodeId,
+              data.blockIndex,
               data.paragraphId,
               createStreamingNode(
                 data.nodeId,
@@ -259,6 +240,7 @@ export default function SessionPage({
                 data.depth,
                 data.parentNodeId,
                 data.paragraphId,
+                data.blockIndex,
               ),
             );
           });
@@ -320,6 +302,15 @@ export default function SessionPage({
     autoSizeTextarea(composerTextareaRef.current, 48, 120);
   }, [rootQuestion]);
 
+  useEffect(() => {
+    const viewKey = getViewKey(currentView);
+    const restoreScrollTop = viewScrollPositions.current[viewKey] ?? 0;
+
+    requestAnimationFrame(() => {
+      setViewportScrollTop(chatContainerRef.current, restoreScrollTop);
+    });
+  }, [currentView]);
+
   const withBusy = async (key: string, action: () => Promise<void>) => {
     setBusyKey(key);
     setError(null);
@@ -333,13 +324,14 @@ export default function SessionPage({
   };
 
   const pushView = (view: ViewState) => {
+    const currentKey = getViewKey(currentView);
+    viewScrollPositions.current[currentKey] = getViewportScrollTop(chatContainerRef.current);
     setViewStack((prev) => [...prev, view]);
-    requestAnimationFrame(() => {
-      chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    });
   };
 
   const popToView = (index: number) => {
+    const currentKey = getViewKey(currentView);
+    viewScrollPositions.current[currentKey] = getViewportScrollTop(chatContainerRef.current);
     setViewStack((prev) => prev.slice(0, index + 1));
   };
 
@@ -391,7 +383,7 @@ export default function SessionPage({
         </div>
       )}
 
-      <div className="chat-container">
+      <div className="chat-container" ref={chatContainerRef}>
         {currentView.type === "root" && (
           <>
             {snapshot?.rootNodes.length === 0 && Object.keys(streamingNodes).length === 0 && (
@@ -419,7 +411,7 @@ export default function SessionPage({
           <div className="paragraph-view">
             {(() => {
               const context = snapshot
-                ? findParagraphContext(snapshot.rootNodes, currentView.nodeId, currentView.paragraphId)
+                ? findParagraphContext(snapshot.rootNodes, currentView.nodeId, currentView.blockIndex)
                 : null;
               if (!context) {
                 return (
@@ -428,7 +420,9 @@ export default function SessionPage({
                   </div>
                 );
               }
-              const childNodes = context.parentNode.children.filter((child) => child.paragraphId === currentView.paragraphId);
+              const childNodes = context.paragraph.id
+                ? context.parentNode.children.filter((child) => child.paragraphId === context.paragraph.id)
+                : [];
               return (
                 <>
                   <div className="paragraph-context">
@@ -518,13 +512,13 @@ export default function SessionPage({
               }
 
               if (!rootQuestion.trim() || !canAskParagraph) return;
-              void withBusy(`ask-${currentView.paragraphId}`, async () => {
+              void withBusy(`ask-${currentView.blockIndex}`, async () => {
                 const question = rootQuestion;
                 setRootQuestion("");
-                const res = await api.askOnParagraph(
+                const res = await api.askOnBlock(
                   token,
                   currentView.nodeId,
-                  currentView.paragraphId,
+                  currentView.blockIndex,
                   question,
                 );
                 setSnapshot((prev) =>
@@ -532,21 +526,24 @@ export default function SessionPage({
                     ? insertChildNode(
                         prev,
                         currentView.nodeId,
-                        currentView.paragraphId,
+                        res.blockIndex,
+                        res.paragraphId,
                         createStreamingNode(
                           res.nodeId,
                           question,
                           me.username,
                           getNodeDepth(prev.rootNodes, currentView.nodeId) + 1,
                           currentView.nodeId,
-                          currentView.paragraphId,
+                          res.paragraphId,
+                          res.blockIndex,
                         ),
                       )
                     : prev,
                 );
                 await attachNode(res.nodeId, {
                   parentNodeId: currentView.nodeId,
-                  paragraphId: currentView.paragraphId,
+                  paragraphId: res.paragraphId,
+                  blockIndex: res.blockIndex,
                   question,
                 });
                 window.setTimeout(() => {
@@ -572,7 +569,7 @@ export default function SessionPage({
               disabled={
                 currentView.type === "root"
                   ? !canAskRoot || busyKey === "ask-root"
-                  : !canAskParagraph || busyKey === `ask-${currentView.paragraphId}`
+                  : !canAskParagraph || busyKey === `ask-${currentView.blockIndex}`
               }
               rows={1}
               onKeyDown={(e) => {
@@ -587,7 +584,7 @@ export default function SessionPage({
               disabled={
                 currentView.type === "root"
                   ? !canAskRoot || busyKey === "ask-root"
-                  : !canAskParagraph || busyKey === `ask-${currentView.paragraphId}`
+                  : !canAskParagraph || busyKey === `ask-${currentView.blockIndex}`
               }
               type="submit"
             >
@@ -621,11 +618,11 @@ function findNodeInTree(root: ConversationNodeDto, nodeId: string): boolean {
 function findParagraphContext(
   roots: ConversationNodeDto[],
   nodeId: string,
-  paragraphId: string,
+  blockIndex: number,
 ): { parentNode: ConversationNodeDto; paragraph: ParagraphDto } | null {
   const parentNode = roots.map((root) => findNode(root, nodeId)).find(Boolean) ?? null;
   if (!parentNode) return null;
-  const paragraph = parentNode.paragraphs.find((item) => item.id === paragraphId) ?? null;
+  const paragraph = parentNode.paragraphs.find((item) => item.index === blockIndex) ?? null;
   if (!paragraph) return null;
   return { parentNode, paragraph };
 }
@@ -659,6 +656,7 @@ function createStreamingNode(
   depth: number,
   parentNodeId?: string,
   paragraphId?: string,
+  blockIndex?: number,
 ): ConversationNodeDto {
   return {
     id: nodeId,
@@ -683,6 +681,7 @@ function insertRootNode(snapshot: SessionSnapshotDto, node: ConversationNodeDto)
 function insertChildNode(
   snapshot: SessionSnapshotDto,
   parentNodeId: string,
+  blockIndex: number,
   paragraphId: string,
   childNode: ConversationNodeDto,
 ): SessionSnapshotDto {
@@ -694,8 +693,12 @@ function insertChildNode(
       return {
         ...node,
         paragraphs: node.paragraphs.map((paragraph) =>
-          paragraph.id === paragraphId
-            ? { ...paragraph, childNodeCount: paragraph.childNodeCount + 1 }
+          paragraph.index === blockIndex
+            ? {
+                ...paragraph,
+                id: paragraph.id ?? paragraphId,
+                childNodeCount: paragraph.childNodeCount + 1,
+              }
             : paragraph,
         ),
         children: [...node.children, childNode],
@@ -710,21 +713,6 @@ function appendNodeContent(snapshot: SessionSnapshotDto, nodeId: string, chunk: 
     ...snapshot,
     rootNodes: snapshot.rootNodes.map((root) =>
       updateNode(root, nodeId, (node) => ({ ...node, fullContent: node.fullContent + chunk })),
-    ),
-  };
-}
-
-function upsertParagraph(snapshot: SessionSnapshotDto, nodeId: string, paragraph: ParagraphDto): SessionSnapshotDto {
-  return {
-    ...snapshot,
-    rootNodes: snapshot.rootNodes.map((root) =>
-      updateNode(root, nodeId, (node) => ({
-        ...node,
-        paragraphs: [
-          ...node.paragraphs.filter((item) => item.id !== paragraph.id),
-          paragraph,
-        ].sort((a, b) => a.index - b.index),
-      })),
     ),
   };
 }
@@ -754,10 +742,6 @@ function updateNode(
   return changed ? { ...node, children } : node;
 }
 
-function getParagraphChildCount(snapshot: SessionSnapshotDto, nodeId: string, paragraphId: string): number {
-  return findParagraphContext(snapshot.rootNodes, nodeId, paragraphId)?.paragraph.childNodeCount ?? 0;
-}
-
 function getNodeDepth(roots: ConversationNodeDto[], nodeId: string): number {
   return (roots.map((root) => findNode(root, nodeId)).find(Boolean) ?? null)?.depth ?? 0;
 }
@@ -778,15 +762,8 @@ function reconcileStreamingNodes(
       question: live?.question ?? node.question ?? undefined,
       parentNodeId: live?.parentNodeId ?? node.parentId ?? undefined,
       paragraphId: live?.paragraphId ?? node.paragraphId ?? undefined,
+      blockIndex: live?.blockIndex,
       content: node.fullContent || live?.content || "",
-      paragraphs:
-        node.paragraphs.length > 0
-          ? node.paragraphs.map((paragraph) => ({
-              id: paragraph.id,
-              index: paragraph.index,
-              content: paragraph.content,
-            }))
-          : live?.paragraphs ?? [],
       done: node.status === "COMPLETE" || live?.done === true,
     };
 
@@ -892,18 +869,18 @@ function ChatNode({
             {hasFinalParagraphs
               ? node.paragraphs.map((paragraph) => (
                   <div
-                    key={paragraph.id}
+                    key={paragraph.id ?? `block-${paragraph.index}`}
                     className={`ai-paragraph ${isCodeFenceBlock(paragraph.content) ? "ai-paragraph-code" : ""}`}
                     onClick={() => {
                       if (depth < MAX_THREAD_DEPTH) {
-                        onPushView({ type: "paragraph", nodeId: node.id, paragraphId: paragraph.id });
+                        onPushView({ type: "paragraph", nodeId: node.id, blockIndex: paragraph.index });
                       }
                     }}
                   >
                     {renderBlock(parseSingleBlock(paragraph.content))}
                     {depth < MAX_THREAD_DEPTH && (
                       <div className="thread-indicator">
-                        {paragraph.childNodeCount > 0 ? `${paragraph.childNodeCount} threads` : "Discuss this"}
+                        {paragraph.childNodeCount > 0 ? `${paragraph.childNodeCount} discussions` : "Discuss"}
                       </div>
                     )}
                   </div>
@@ -1054,4 +1031,32 @@ function autoSizeTextarea(
   const nextHeight = Math.min(element.scrollHeight, maxHeight);
   element.style.height = `${Math.max(minHeight, nextHeight)}px`;
   element.style.overflowY = element.scrollHeight > maxHeight ? "auto" : "hidden";
+}
+
+function getViewKey(view: ViewState): string {
+  switch (view.type) {
+    case "root":
+      return "root";
+    case "paragraph":
+      return `paragraph:${view.nodeId}:${view.blockIndex}`;
+    case "node":
+      return `node:${view.nodeId}`;
+  }
+}
+
+function getViewportScrollTop(container: HTMLDivElement | null): number {
+  if (typeof window !== "undefined") {
+    return window.scrollY || window.pageYOffset || 0;
+  }
+  return container?.scrollTop ?? 0;
+}
+
+function setViewportScrollTop(container: HTMLDivElement | null, top: number) {
+  if (typeof window !== "undefined") {
+    window.scrollTo({ top, behavior: "auto" });
+    return;
+  }
+  if (container) {
+    container.scrollTop = top;
+  }
 }

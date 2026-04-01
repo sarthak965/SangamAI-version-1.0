@@ -6,4 +6,5 @@ import java.util.UUID;
 
 public interface ParagraphRepository extends JpaRepository<Paragraph, UUID> {
     List<Paragraph> findByNodeIdOrderByIndex(UUID nodeId);
+    java.util.Optional<Paragraph> findByNodeIdAndIndex(UUID nodeId, int index);
 }

@@ -8,8 +8,11 @@ import com.sangam.ai.session.dto.*;
 import com.sangam.ai.user.User;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.HashMap;
 import java.util.List;
@@ -31,6 +34,10 @@ public class SessionService {
     private final EnvironmentMemberRepository memberRepository;
     private final AiJobQueue jobQueue;
     private final CentrifugoService centrifugoService;
+    private final ContentBlockParser contentBlockParser;
+
+    public record BlockAskResult(UUID nodeId, UUID paragraphId, int blockIndex) {
+    }
 
     @Transactional
     public Session createSession(UUID environmentId, String title, User user) {
@@ -47,6 +54,7 @@ public class SessionService {
                 .build());
     }
 
+    @Transactional
     public UUID ask(UUID sessionId, String question, User user) {
         Session session = sessionRepository.findById(sessionId)
                 .orElseThrow(() -> new IllegalArgumentException("Session not found"));
@@ -64,22 +72,22 @@ public class SessionService {
                 .status(ConversationNode.Status.STREAMING)
                 .build());
 
-        // Notify all session members that a new root stream has started
-        centrifugoService.publishNodeCreated(
-                sessionId,
-                new HashMap<>() {{
-                    put("type", "root_node_created");
-                    put("nodeId", node.getId().toString());
-                    put("depth", 0);
-                    put("question", question);
-                    put("askedBy", user.getUsername());
-                }}
-        );
+        runAfterCommit(() -> {
+            centrifugoService.publishNodeCreated(
+                    sessionId,
+                    new HashMap<>() {{
+                        put("type", "root_node_created");
+                        put("nodeId", node.getId().toString());
+                        put("depth", 0);
+                        put("question", question);
+                        put("askedBy", user.getUsername());
+                    }}
+            );
 
-        // Push to Redis queue — worker picks it up and streams
-        jobQueue.enqueue(AiJob.rootJob(
-                node.getId(), sessionId, question, user.getId()));
-        snapshotCacheService.invalidate(sessionId);
+            jobQueue.enqueue(AiJob.rootJob(
+                    node.getId(), sessionId, question, user.getId()));
+            snapshotCacheService.invalidate(sessionId);
+        });
 
         return node.getId();
     }
@@ -98,6 +106,15 @@ public class SessionService {
                     "Paragraph does not belong to this node");
         }
 
+        return createChildNode(parentNode, targetParagraph, question, user);
+    }
+
+    @Transactional
+    public BlockAskResult askOnBlock(UUID parentNodeId, int blockIndex,
+                                     String question, User user) {
+        ConversationNode parentNode = nodeRepository.findById(parentNodeId)
+                .orElseThrow(() -> new IllegalArgumentException("Node not found"));
+
         if (parentNode.getDepth() >= MAX_DEPTH) {
             throw new IllegalArgumentException(
                     "Maximum conversation depth (" + MAX_DEPTH + ") reached");
@@ -106,39 +123,19 @@ public class SessionService {
         assertCanInteractWithAi(
                 parentNode.getSession().getEnvironment().getId(), user);
 
-        // Create child node immediately
-        ConversationNode childNode = nodeRepository.save(ConversationNode.builder()
-                .session(parentNode.getSession())
-                .parent(parentNode)
-                .paragraphId(paragraphId)
-                .depth(parentNode.getDepth() + 1)
-                .question(question)
-                .askedBy(user)
-                .fullContent("")
-                .status(ConversationNode.Status.STREAMING)
-                .build());
+        if (parentNode.getStatus() == ConversationNode.Status.STREAMING) {
+            throw new IllegalArgumentException("Wait for the answer to finish before starting a thread");
+        }
 
-        // Notify all members a new thread has appeared
-        centrifugoService.publishNodeCreated(
-                parentNode.getSession().getId(),
-                new HashMap<>() {{
-                    put("type", "child_node_created");
-                    put("nodeId", childNode.getId().toString());
-                    put("parentNodeId", parentNodeId.toString());
-                    put("paragraphId", paragraphId.toString());
-                    put("depth", childNode.getDepth());
-                    put("question", question);
-                    put("askedBy", user.getUsername());
-                }}
-        );
+        List<String> blocks = contentBlockParser.split(parentNode.getFullContent());
+        if (blockIndex < 0 || blockIndex >= blocks.size()) {
+            throw new IllegalArgumentException("Selected block not found");
+        }
 
-        // Push to Redis queue
-        jobQueue.enqueue(AiJob.paragraphJob(
-                childNode.getId(), parentNode.getSession().getId(),
-                question, user.getId(), parentNodeId, paragraphId));
-        snapshotCacheService.invalidate(parentNode.getSession().getId());
+        Paragraph anchor = findOrCreateAnchor(parentNode, blockIndex, blocks.get(blockIndex));
 
-        return childNode.getId();
+        UUID childNodeId = createChildNode(parentNode, anchor, question, user);
+        return new BlockAskResult(childNodeId, anchor.getId(), blockIndex);
     }
 
     public SessionSnapshotDto getSnapshot(UUID sessionId, User user) {
@@ -189,20 +186,31 @@ public class SessionService {
     private ConversationNodeDto buildNodeDto(
             ConversationNode node, List<ConversationNode> allNodes) {
 
-        List<Paragraph> paragraphs =
-                paragraphRepository.findByNodeIdOrderByIndex(node.getId());
+        List<Paragraph> anchors = paragraphRepository.findByNodeIdOrderByIndex(node.getId());
+        List<String> blocks = contentBlockParser.split(node.getFullContent());
 
         List<ConversationNode> children = allNodes.stream()
                 .filter(n -> node.getId().equals(
                         n.getParent() != null ? n.getParent().getId() : null))
                 .toList();
 
-        List<ParagraphDto> paragraphDtos = paragraphs.stream()
-                .map(p -> {
-                    int childCount = (int) children.stream()
-                            .filter(c -> p.getId().equals(c.getParagraphId()))
+        Map<Integer, Paragraph> anchorsByIndex = anchors.stream()
+                .collect(java.util.stream.Collectors.toMap(Paragraph::getIndex, p -> p));
+
+        List<ParagraphDto> paragraphDtos = java.util.stream.IntStream.range(0, blocks.size())
+                .mapToObj(index -> {
+                    Paragraph anchor = anchorsByIndex.get(index);
+                    int childCount = anchor == null
+                            ? 0
+                            : (int) children.stream()
+                            .filter(c -> anchor.getId().equals(c.getParagraphId()))
                             .count();
-                    return ParagraphDto.from(p, childCount);
+                    return ParagraphDto.display(
+                            anchor != null ? anchor.getId() : null,
+                            index,
+                            blocks.get(index),
+                            childCount
+                    );
                 })
                 .toList();
 
@@ -211,6 +219,75 @@ public class SessionService {
                 .toList();
 
         return ConversationNodeDto.from(node, paragraphDtos, childDtos);
+    }
+
+    private UUID createChildNode(
+            ConversationNode parentNode,
+            Paragraph anchor,
+            String question,
+            User user) {
+
+        if (parentNode.getDepth() >= MAX_DEPTH) {
+            throw new IllegalArgumentException(
+                    "Maximum conversation depth (" + MAX_DEPTH + ") reached");
+        }
+
+        assertCanInteractWithAi(
+                parentNode.getSession().getEnvironment().getId(), user);
+
+        if (parentNode.getStatus() == ConversationNode.Status.STREAMING) {
+            throw new IllegalArgumentException("Wait for the answer to finish before starting a thread");
+        }
+
+        ConversationNode childNode = nodeRepository.save(ConversationNode.builder()
+                .session(parentNode.getSession())
+                .parent(parentNode)
+                .paragraphId(anchor.getId())
+                .depth(parentNode.getDepth() + 1)
+                .question(question)
+                .askedBy(user)
+                .fullContent("")
+                .status(ConversationNode.Status.STREAMING)
+                .build());
+
+        runAfterCommit(() -> {
+            centrifugoService.publishNodeCreated(
+                    parentNode.getSession().getId(),
+                    new HashMap<>() {{
+                        put("type", "child_node_created");
+                        put("nodeId", childNode.getId().toString());
+                        put("parentNodeId", parentNode.getId().toString());
+                        put("paragraphId", anchor.getId().toString());
+                        put("blockIndex", anchor.getIndex());
+                        put("depth", childNode.getDepth());
+                        put("question", question);
+                        put("askedBy", user.getUsername());
+                    }}
+            );
+
+            jobQueue.enqueue(AiJob.paragraphJob(
+                    childNode.getId(), parentNode.getSession().getId(),
+                    question, user.getId(), parentNode.getId(), anchor.getId()));
+            snapshotCacheService.invalidate(parentNode.getSession().getId());
+        });
+
+        return childNode.getId();
+    }
+
+    private Paragraph findOrCreateAnchor(ConversationNode parentNode, int blockIndex, String blockContent) {
+        return paragraphRepository.findByNodeIdAndIndex(parentNode.getId(), blockIndex)
+                .orElseGet(() -> {
+                    try {
+                        return paragraphRepository.save(Paragraph.builder()
+                                .node(parentNode)
+                                .index(blockIndex)
+                                .content(blockContent)
+                                .build());
+                    } catch (DataIntegrityViolationException e) {
+                        return paragraphRepository.findByNodeIdAndIndex(parentNode.getId(), blockIndex)
+                                .orElseThrow(() -> e);
+                    }
+                });
     }
 
     private void assertCanAskRootAi(UUID environmentId, User user) {
@@ -240,6 +317,23 @@ public class SessionService {
                     "You don't have permission to interact with AI");
         }
     }
+
+    private void runAfterCommit(Runnable action) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()) {
+            action.run();
+            return;
+        }
+
+        TransactionSynchronizationManager.registerSynchronization(
+                new TransactionSynchronization() {
+                    @Override
+                    public void afterCommit() {
+                        action.run();
+                    }
+                }
+        );
+    }
+
     public List<Map<String, Object>> getSessionsForEnvironment(
             UUID environmentId, User user) {
 

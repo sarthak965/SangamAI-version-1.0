@@ -1,5 +1,5 @@
 import { Suspense, lazy, useEffect, useState } from "react";
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { api } from "./lib/api";
 import { realtimeManager } from "./lib/realtime";
 import type { AuthResponse, CurrentUser } from "./types";
@@ -95,23 +95,27 @@ function App() {
         <Route
           path="/"
           element={
-            <LandingPage
-              currentUser={me}
-              authLoading={authLoading}
-              authError={authError}
-              onAuthenticated={handleAuthenticated}
-            />
+            <PageTransition>
+              <LandingPage
+                currentUser={me}
+                authLoading={authLoading}
+                authError={authError}
+                onAuthenticated={handleAuthenticated}
+              />
+            </PageTransition>
           }
         />
         <Route
           path="/auth"
           element={
-            <AuthPage
-              currentUser={me}
-              authLoading={authLoading}
-              authError={authError}
-              onAuthenticated={handleAuthenticated}
-            />
+            <PageTransition>
+              <AuthPage
+                currentUser={me}
+                authLoading={authLoading}
+                authError={authError}
+                onAuthenticated={handleAuthenticated}
+              />
+            </PageTransition>
           }
         />
 
@@ -200,6 +204,16 @@ function RouteLoadingScreen() {
     <div className="loading-screen">
       <div className="spinner" />
       <p>Loading...</p>
+    </div>
+  );
+}
+
+function PageTransition({ children }: { children: React.ReactNode }) {
+  const location = useLocation();
+
+  return (
+    <div key={location.pathname} className="route-transition">
+      {children}
     </div>
   );
 }

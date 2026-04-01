@@ -70,6 +70,23 @@ public class SessionController {
         return ResponseEntity.ok(ApiResponse.ok(Map.of("nodeId", childNodeId)));
     }
 
+    @PostMapping("/nodes/{nodeId}/blocks/{blockIndex}/ask")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> askOnBlock(
+            @PathVariable UUID nodeId,
+            @PathVariable int blockIndex,
+            @Valid @RequestBody AskOnParagraphRequest request,
+            @AuthenticationPrincipal User currentUser) {
+
+        SessionService.BlockAskResult result = sessionService.askOnBlock(
+                nodeId, blockIndex, request.question(), currentUser);
+
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "nodeId", result.nodeId(),
+                "paragraphId", result.paragraphId(),
+                "blockIndex", result.blockIndex()
+        )));
+    }
+
     // GET /api/sessions/{sessionId}/snapshot — full tree for new members
     @GetMapping("/sessions/{sessionId}/snapshot")
     public ResponseEntity<ApiResponse<SessionSnapshotDto>> getSnapshot(

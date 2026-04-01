@@ -316,6 +316,22 @@ export const api = {
     );
   },
 
+  askOnBlock(
+    token: string,
+    nodeId: string,
+    blockIndex: number,
+    question: string,
+  ) {
+    return request<{ nodeId: string; paragraphId: string; blockIndex: number }>(
+      `/api/nodes/${nodeId}/blocks/${blockIndex}/ask`,
+      {
+        method: "POST",
+        body: JSON.stringify({ question }),
+      },
+      token,
+    );
+  },
+
   getCentrifugoToken(token: string) {
     return request<CentrifugoConnectionToken>(
       "/api/centrifugo/token",

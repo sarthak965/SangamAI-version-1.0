@@ -84,7 +84,7 @@ export interface SessionListItem {
 }
 
 export interface ParagraphDto {
-  id: string;
+  id: string | null;
   index: number;
   content: string;
   childNodeCount: number;
@@ -137,6 +137,7 @@ export interface SessionEventChildNodeCreated {
   nodeId: string;
   parentNodeId: string;
   paragraphId: string;
+  blockIndex: number;
   depth: number;
   question: string;
   askedBy: string;
@@ -167,9 +168,9 @@ export type NodeStreamEvent =
 export interface StreamingNodeState {
   nodeId: string;
   content: string;
-  paragraphs: { id: string; index: number; content: string }[];
   done: boolean;
   parentNodeId?: string;
   paragraphId?: string;
+  blockIndex?: number;
   question?: string;
 }
